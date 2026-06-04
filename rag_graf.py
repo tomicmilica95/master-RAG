@@ -39,7 +39,7 @@ sickle = Sickle(url)
 records = sickle.ListRecords(metadataPrefix='dim', set='theses')
 
 # Ovde kontrolisemo koliko radova zelimo da uvezemo u ovom krugu
-BROJ_RADOVA_ZA_UVOZ = 100
+BROJ_RADOVA_ZA_UVOZ = 10
 brojac_rada = 0
 
 # Funkcija za upis u Neo4j graf bazu
@@ -86,18 +86,33 @@ for record in records:
         with urllib.request.urlopen(req) as response:
             pdf_citac = PdfReader(io.BytesIO(response.read()))
 
-        # Ekstrakcija teksta i seckanje na pasuse (chunks)
+        # Ekstrakcija teksta i seckanje po paragrafima (structure-based chunking)
         chunks = []
-        trenutni_tekst = ""
         for br_strane, strana in enumerate(pdf_citac.pages):
             tekst_strane = strana.extract_text()
             if not tekst_strane:
                 continue
-            trenutni_tekst += f"\n[Stranica {br_strane+1}]\n" + tekst_strane
 
-            while len(trenutni_tekst) >= 1000:
-                chunks.append({"tekst": trenutni_tekst[:1000], "stranica": br_strane + 1})
-                trenutni_tekst = trenutni_tekst[1000:]
+            paragrafi = re.split(r'\n\s*\n', tekst_strane)
+            for paragraf in paragrafi:
+                paragraf = paragraf.strip()
+                if len(paragraf) < 100:
+                    continue  # preskaci zaglavlja, brojeve strana, kratke fragmente
+                if len(paragraf) <= 1500:
+                    chunks.append({"tekst": paragraf, "stranica": br_strane + 1})
+                else:
+                    # predugacak paragraf — seci po recenicama
+                    recenice = re.split(r'(?<=[.!?])\s+', paragraf)
+                    trenutni = ""
+                    for recenica in recenice:
+                        if len(trenutni) + len(recenica) + 1 <= 1500:
+                            trenutni += (" " if trenutni else "") + recenica
+                        else:
+                            if len(trenutni) >= 100:
+                                chunks.append({"tekst": trenutni, "stranica": br_strane + 1})
+                            trenutni = recenica
+                    if len(trenutni) >= 100:
+                        chunks.append({"tekst": trenutni, "stranica": br_strane + 1})
 
         # Slanje podataka u bazu grafova
         with driver.session() as session:

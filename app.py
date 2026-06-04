@@ -25,6 +25,10 @@ def inicijalizuj_veze():
 
 client, driver = inicijalizuj_veze()
 
+# Full-text indeks — kreira se jednom, idempotentna operacija
+with driver.session() as _s:
+    _s.run("CREATE FULLTEXT INDEX chunk_fulltext IF NOT EXISTS FOR (c:Chunk) ON EACH [c.tekst]")
+
 st.title("CRIS UNS - GraphRAG Asistent")
 st.markdown("Postavite pitanje u vezi sa dokumentima koji se nalaze u bazi znanja.")
 st.info("Sistem koristi hibridnu pretragu kroz graf bazu kako bi pronasao tacne odgovore.")
@@ -93,6 +97,8 @@ def je_meta_pitanje(pitanje):
         "koliko radova", "sta pretrazujes", "koje radove pretrazujes",
         "koji su radovi", "koje su disertacije", "sta imas u bazi",
         "koji se radovi", "koji dokumenti su",
+        "izlistaj", "sve disertacije", "sve radove", "nabrojati", "nabroj",
+        "prikazi sve", "prikaži sve", "lista disertacija", "lista radova",
     ]
     return any(kljuc in p for kljuc in kljucne_reci)
 
@@ -145,6 +151,39 @@ def normalizuj_za_pretragu(tekst):
     return unicodedata.normalize('NFD', tekst.lower()).encode('ascii', 'ignore').decode('ascii')
 
 
+_LAT_U_CIR = [
+    ('lj','љ'),('LJ','Љ'),('Lj','Љ'),('nj','њ'),('NJ','Њ'),('Nj','Њ'),
+    ('dž','џ'),('DŽ','Џ'),('Dž','Џ'),('dj','ђ'),('DJ','Ђ'),('Dj','Ђ'),
+    ('š','ш'),('Š','Ш'),('č','ч'),('Č','Ч'),('ć','ћ'),('Ć','Ћ'),
+    ('ž','ж'),('Ž','Ж'),('đ','ђ'),('Đ','Ђ'),
+    ('a','а'),('b','б'),('v','в'),('g','г'),('d','д'),('e','е'),
+    ('z','з'),('i','и'),('j','ј'),('k','к'),('l','л'),('m','м'),
+    ('n','н'),('o','о'),('p','п'),('r','р'),('s','с'),('t','т'),
+    ('u','у'),('f','ф'),('h','х'),('c','ц'),
+    ('A','А'),('B','Б'),('V','В'),('G','Г'),('D','Д'),('E','Е'),
+    ('Z','З'),('I','И'),('J','Ј'),('K','К'),('L','Л'),('M','М'),
+    ('N','Н'),('O','О'),('P','П'),('R','Р'),('S','С'),('T','Т'),
+    ('U','У'),('F','Ф'),('H','Х'),('C','Ц'),
+]
+
+_STOPWORDS = {
+    "je", "su", "i", "u", "na", "za", "se", "a", "o", "ali", "da",
+    "ili", "od", "do", "iz", "po", "sa", "koji", "koja", "koje",
+    "sta", "kako", "kada", "gde", "ovo", "ova", "ovaj", "ne", "ni",
+    "vec", "jos", "uvek", "samo", "ima", "nema", "the", "and", "of",
+    "in", "for", "is", "are", "ovom", "ovim", "radu", "rad",
+}
+
+def u_cirilicu(tekst):
+    for lat, cir in _LAT_U_CIR:
+        tekst = tekst.replace(lat, cir)
+    return tekst
+
+def izvuci_kljucne_reci(pitanje):
+    reci = re.findall(r'\b\w+\b', pitanje.lower())
+    return [r for r in reci if r not in _STOPWORDS and len(r) > 3]
+
+
 def pronadji_disertaciju_po_naslovu(naslov_fragment):
     with driver.session() as session:
         # Prvo pokušaj direktno poređenje (ćirilica = ćirilica)
@@ -190,28 +229,48 @@ def generisi_odgovor(pitanje_korisnika):
     naslov_disertacije = pronadji_disertaciju_po_naslovu(naslov_fragment) if naslov_fragment else None
 
     if naslov_disertacije:
-        # Graf pretraga: direktno povuci chunkove iz imenovanog rada
-        upit_za_bazu = """
-        MATCH (d:Disertacija {naslov: $naslov})-[:IMA_DEO]->(c:Chunk)
-        RETURN c.tekst AS tekst, c.stranica AS stranica, d.naslov AS naslov, 1.0 AS score
-        ORDER BY c.stranica ASC LIMIT 5
-        """
-        params = {"naslov": naslov_disertacije}
+        pronadjeni_pasusi = []
+        with driver.session() as session:
+            for zapis in session.run("""
+                MATCH (d:Disertacija {naslov: $naslov})-[:IMA_DEO]->(c:Chunk)
+                RETURN c.tekst AS tekst, c.stranica AS stranica, d.naslov AS naslov, 1.0 AS score
+                ORDER BY c.stranica ASC LIMIT 5
+            """, {"naslov": naslov_disertacije}):
+                pronadjeni_pasusi.append({**dict(zapis), "tip": "graf"})
     else:
-        # Standardna vektorska pretraga
-        upit_za_bazu = """
-        CALL db.index.vector.queryNodes('chunk_embeddings', 3, $pitanje_embedding)
-        YIELD node, score
-        MATCH (d:Disertacija)-[:IMA_DEO]->(node)
-        RETURN node.tekst AS tekst, node.stranica AS stranica, d.naslov AS naslov, score
-        """
-        params = {"pitanje_embedding": pitanje_embedding}
+        pronadjeni_pasusi = []
+        vidjena_tekst = set()
 
-    pronadjeni_pasusi = []
-    with driver.session() as session:
-        rezultati = session.run(upit_za_bazu, params)
-        for zapis in rezultati:
-            pronadjeni_pasusi.append(zapis)
+        with driver.session() as session:
+            for z in session.run("""
+                CALL db.index.vector.queryNodes('chunk_embeddings', 5, $emb)
+                YIELD node, score
+                WHERE size(node.tekst) > 200
+                MATCH (d:Disertacija)-[:IMA_DEO]->(node)
+                RETURN node.tekst AS tekst, node.stranica AS stranica, d.naslov AS naslov, score
+            """, {"emb": pitanje_embedding}):
+                if z["tekst"] not in vidjena_tekst:
+                    vidjena_tekst.add(z["tekst"])
+                    pronadjeni_pasusi.append({**dict(z), "tip": "vektor"})
+
+            kljucne_reci = izvuci_kljucne_reci(pitanje_korisnika)
+            if kljucne_reci:
+                cir_reci = [u_cirilicu(r) for r in kljucne_reci]
+                ft_upit = " OR ".join(
+                    [re.sub(r'[+\-!(){}\[\]^"~*?:\\/]', ' ', r) for r in cir_reci + kljucne_reci]
+                )
+                try:
+                    for z in session.run("""
+                        CALL db.index.fulltext.queryNodes('chunk_fulltext', $upit, {limit: 5})
+                        YIELD node, score
+                        MATCH (d:Disertacija)-[:IMA_DEO]->(node)
+                        RETURN node.tekst AS tekst, node.stranica AS stranica, d.naslov AS naslov, score
+                    """, {"upit": ft_upit}):
+                        if z["tekst"] not in vidjena_tekst:
+                            vidjena_tekst.add(z["tekst"])
+                            pronadjeni_pasusi.append({**dict(z), "tip": "keyword"})
+                except Exception:
+                    pass
 
     if not naslov_disertacije and (not pronadjeni_pasusi or max(p["score"] for p in pronadjeni_pasusi) < 0.70):
         return "Na osnovu dokumenata u bazi, ne mogu da pronadjem odgovor.", []
@@ -219,30 +278,38 @@ def generisi_odgovor(pitanje_korisnika):
     if not pronadjeni_pasusi:
         return f"Rad '{naslov_fragment}' nije pronađen u bazi znanja.", []
 
+    # Sortiraj po scoru i ograniči na top 3 pasusa koja idu u LLM kontekst
+    pronadjeni_pasusi = sorted(pronadjeni_pasusi, key=lambda p: p["score"], reverse=True)[:3]
+
     kontekst = ""
     vidljivi_radovi = {}
-    for i, pasus in enumerate(pronadjeni_pasusi):
+    for pasus in pronadjeni_pasusi:
         naslov = pasus['naslov']
-        if naslov not in vidljivi_radovi or pasus['score'] > vidljivi_radovi[naslov]:
-            vidljivi_radovi[naslov] = pasus['score']
+        tip = pasus.get('tip', 'vektor')
+        if naslov not in vidljivi_radovi:
+            vidljivi_radovi[naslov] = {"score": pasus['score'], "tip": tip}
         kontekst += (
-            f"\n--- IZVOR {i+1} ---\n"
-            f"Naslov disertacije: {naslov}\n"
-            f"Stranica: {pasus['stranica']}\n"
+            f"\n--- IZ RADA: {naslov} (stranica {pasus['stranica']}) ---\n"
             f"Tekst:\n{pasus['tekst']}\n"
         )
 
-    izvori = [
-        f"Rad: '{naslov}' (Slicnost: {round(score*100, 1)}%)"
-        for naslov, score in vidljivi_radovi.items()
-    ]
+    izvori = []
+    for naslov, info in vidljivi_radovi.items():
+        if info["tip"] == "graf":
+            izvori.append(f"Rad: '{naslov}' (Direktna pretraga po naslovu)")
+        elif info["tip"] == "keyword":
+            izvori.append(f"Rad: '{naslov}' (Pronađen keyword pretragom)")
+        else:
+            izvori.append(f"Rad: '{naslov}' (Semantička sličnost: {round(info['score']*100, 1)}%)")
 
     sistemski_prompt = (
         "Ti si strucni asistent za univerzitetske doktorske disertacije. "
         "Odgovori na korisnikovo pitanje koristeci iskljucivo prilozeni kontekst — "
         "ukljucujuci i naslove disertacija i tekst pasusa, jer naslovi mogu sadrzati kljucne informacije. "
-        "Odgovori na srpskom jeziku (koristi kvacice u recima), budi profesionalan i precizan. "
-        "Ako kontekst sadrzi delimicno relevantne informacije, upotrebi ih i jasno naznaci na osnovu cega odgovaras. "
+        "Odgovori na srpskom jeziku koristeci iskljucivo standardne srpske reci — nemoj izmisljati reci niti koristiti strane reci kada postoji srpski ekvivalent. "
+        "Pisi iskljucivo latinicom, nikada cirilicom. "
+        "Budi profesionalan, precizan i koncizan. "
+        "Ako kontekst sadrzi delimicno relevantne informacije, upotrebi ih i jasno naznaci iz kog rada i sa koje stranice. "
         "Samo ako prilozen kontekst UOPSTE nije relevantan za pitanje, reci tacno: "
         "'Na osnovu trenutnih dokumenata u bazi ne mogu da odgovorim na to pitanje.'"
     )
