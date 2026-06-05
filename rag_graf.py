@@ -93,6 +93,14 @@ for record in records:
             if not tekst_strane:
                 continue
 
+            # Normalizacija artefakata PDF ekstrakcije:
+            # 1. Spoji reci polomljene prelaskom u novi red (npr. "znač-\najne" -> "značajne")
+            tekst_strane = re.sub(r'(\w)-\s*\n(\w)', r'\1\2', tekst_strane)
+            # 2. Ukloni prelome reda unutar recenice (jedan \n koji nije granica pasusa)
+            tekst_strane = re.sub(r'(?<!\n)\n(?!\n)', ' ', tekst_strane)
+            # 3. Ukloni visestruke razmake nastale nakon normalizacije
+            tekst_strane = re.sub(r' {2,}', ' ', tekst_strane)
+
             paragrafi = re.split(r'\n\s*\n', tekst_strane)
             for paragraf in paragrafi:
                 paragraf = paragraf.strip()

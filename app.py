@@ -128,6 +128,13 @@ def izvuci_naslov_iz_pitanja(pitanje):
     cirilica = re.findall(r'[Ѐ-ӿ][Ѐ-ӿ\s,]*[Ѐ-ӿ]', pitanje)
     if cirilica:
         return max(cirilica, key=len).strip()
+    # Pokusaj da nadjes naslov rada pomenut bez navodnika (lat. fraza iza "u radu", "iz rada", "rad ")
+    bez_navodnika = re.search(
+        r'(?:u radu|iz rada|rad[au]?|in paper|in the paper|paper)\s+([A-ZŠĐČĆŽ][^\?\.]{10,})',
+        pitanje, re.IGNORECASE
+    )
+    if bez_navodnika:
+        return bez_navodnika.group(1).strip()
     return None
 
 
@@ -230,13 +237,41 @@ def generisi_odgovor(pitanje_korisnika):
 
     if naslov_disertacije:
         pronadjeni_pasusi = []
+        vidjena_tekst_graf = set()
         with driver.session() as session:
+            # Vektorska pretraga: globalni top-100 filtrirani na konkretan rad
             for zapis in session.run("""
-                MATCH (d:Disertacija {naslov: $naslov})-[:IMA_DEO]->(c:Chunk)
-                RETURN c.tekst AS tekst, c.stranica AS stranica, d.naslov AS naslov, 1.0 AS score
-                ORDER BY c.stranica ASC LIMIT 5
-            """, {"naslov": naslov_disertacije}):
-                pronadjeni_pasusi.append({**dict(zapis), "tip": "graf"})
+                CALL db.index.vector.queryNodes('chunk_embeddings', 100, $emb)
+                YIELD node, score
+                WHERE size(node.tekst) > 500
+                MATCH (d:Disertacija {naslov: $naslov})-[:IMA_DEO]->(node)
+                RETURN node.tekst AS tekst, node.stranica AS stranica, d.naslov AS naslov, score
+            """, {"naslov": naslov_disertacije, "emb": pitanje_embedding}):
+                if zapis["tekst"] not in vidjena_tekst_graf:
+                    vidjena_tekst_graf.add(zapis["tekst"])
+                    pronadjeni_pasusi.append({**dict(zapis), "tip": "graf"})
+            # Full-text pretraga kljucnih reci unutar konkretnog rada
+            kljucne_reci_grafa = izvuci_kljucne_reci(pitanje_korisnika)
+            if kljucne_reci_grafa:
+                cir_reci_grafa = [u_cirilicu(r) for r in kljucne_reci_grafa]
+                ft_upit_graf = " OR ".join(
+                    [re.sub(r'[+\-!(){}\[\]^"~*?:\\/]', ' ', r) for r in cir_reci_grafa + kljucne_reci_grafa]
+                )
+                try:
+                    for zapis in session.run("""
+                        CALL db.index.fulltext.queryNodes('chunk_fulltext', $upit, {limit: 20})
+                        YIELD node, score
+                        WHERE size(node.tekst) > 500
+                        MATCH (d:Disertacija {naslov: $naslov})-[:IMA_DEO]->(node)
+                        RETURN node.tekst AS tekst, node.stranica AS stranica, d.naslov AS naslov, score
+                    """, {"upit": ft_upit_graf, "naslov": naslov_disertacije}):
+                        if zapis["tekst"] not in vidjena_tekst_graf:
+                            vidjena_tekst_graf.add(zapis["tekst"])
+                            pronadjeni_pasusi.append({**dict(zapis), "tip": "graf"})
+                except Exception:
+                    pass
+        # Sortiraj po scoru, top 3 za LLM
+        pronadjeni_pasusi = sorted(pronadjeni_pasusi, key=lambda p: p["score"], reverse=True)[:3]
     else:
         pronadjeni_pasusi = []
         vidjena_tekst = set()
@@ -245,7 +280,7 @@ def generisi_odgovor(pitanje_korisnika):
             for z in session.run("""
                 CALL db.index.vector.queryNodes('chunk_embeddings', 5, $emb)
                 YIELD node, score
-                WHERE size(node.tekst) > 200
+                WHERE size(node.tekst) > 500
                 MATCH (d:Disertacija)-[:IMA_DEO]->(node)
                 RETURN node.tekst AS tekst, node.stranica AS stranica, d.naslov AS naslov, score
             """, {"emb": pitanje_embedding}):
@@ -263,6 +298,7 @@ def generisi_odgovor(pitanje_korisnika):
                     for z in session.run("""
                         CALL db.index.fulltext.queryNodes('chunk_fulltext', $upit, {limit: 5})
                         YIELD node, score
+                        WHERE size(node.tekst) > 500
                         MATCH (d:Disertacija)-[:IMA_DEO]->(node)
                         RETURN node.tekst AS tekst, node.stranica AS stranica, d.naslov AS naslov, score
                     """, {"upit": ft_upit}):
@@ -272,14 +308,39 @@ def generisi_odgovor(pitanje_korisnika):
                 except Exception:
                     pass
 
-    if not naslov_disertacije and (not pronadjeni_pasusi or max(p["score"] for p in pronadjeni_pasusi) < 0.70):
+    if not naslov_disertacije and (not pronadjeni_pasusi or max(p["score"] for p in pronadjeni_pasusi) < 0.60):
         return "Na osnovu dokumenata u bazi, ne mogu da pronadjem odgovor.", []
 
     if not pronadjeni_pasusi:
         return f"Rad '{naslov_fragment}' nije pronađen u bazi znanja.", []
 
+    # Filtriraj TOC pasuse (sadrzaj sa mnogo tackica — tipican format sadrzaja)
+    pronadjeni_pasusi = [p for p in pronadjeni_pasusi if p["tekst"].count("…") < 5 and p["tekst"].count("....") < 3]
+
     # Sortiraj po scoru i ograniči na top 3 pasusa koja idu u LLM kontekst
     pronadjeni_pasusi = sorted(pronadjeni_pasusi, key=lambda p: p["score"], reverse=True)[:3]
+
+    # "Prati referencu": ako chunk pominje broj stranice, dovuci i cunkove sa te stranice
+    brojevi_stranica = set()
+    for pasus in pronadjeni_pasusi:
+        pomenute = re.findall(r'\b(?:stranici?|strani?|page|str\.?)\s*(\d{1,4})\b', pasus["tekst"], re.IGNORECASE)
+        for br in pomenute:
+            brojevi_stranica.add((pasus["naslov"], int(br)))
+
+    if brojevi_stranica:
+        vidjena_tekst_ref = set(p["tekst"] for p in pronadjeni_pasusi)
+        with driver.session() as session:
+            for (naslov_ref, br_str) in brojevi_stranica:
+                for zapis in session.run("""
+                    MATCH (d:Disertacija {naslov: $naslov})-[:IMA_DEO]->(c:Chunk)
+                    WHERE c.stranica = $stranica AND size(c.tekst) > 200
+                    RETURN c.tekst AS tekst, c.stranica AS stranica, d.naslov AS naslov, 0.85 AS score
+                """, {"naslov": naslov_ref, "stranica": br_str}):
+                    if zapis["tekst"] not in vidjena_tekst_ref:
+                        vidjena_tekst_ref.add(zapis["tekst"])
+                        pronadjeni_pasusi.append({**dict(zapis), "tip": "referenca"})
+        # Ponovo sortiraj sa novim pasusima, top 4 (malo vise jer sada imamo i referenciranu stranicu)
+        pronadjeni_pasusi = sorted(pronadjeni_pasusi, key=lambda p: p["score"], reverse=True)[:4]
 
     kontekst = ""
     vidljivi_radovi = {}
