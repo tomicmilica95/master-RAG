@@ -39,7 +39,7 @@ sickle = Sickle(url)
 records = sickle.ListRecords(metadataPrefix='dim', set='theses')
 
 # Ovde kontrolisemo koliko radova zelimo da uvezemo u ovom krugu
-BROJ_RADOVA_ZA_UVOZ = 10
+BROJ_RADOVA_ZA_UVOZ = 100
 brojac_rada = 0
 
 # Funkcija za upis u Neo4j graf bazu
